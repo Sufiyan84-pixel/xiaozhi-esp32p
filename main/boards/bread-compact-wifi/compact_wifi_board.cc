@@ -17,8 +17,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-// 1 = SH1106 driver (1.3" OLED), 0 = SSD1306 driver (0.96" OLED)
-// Agar display par text 2 pixel khisak ke dikhe ya garbled ho, ye value badal do.
 #ifndef OLED_USE_SH1106
 #define OLED_USE_SH1106 1
 #endif
@@ -252,9 +250,7 @@ public:
 #ifdef AUDIO_I2S_METHOD_SIMPLEX
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT,
-            I2S_STD_SLOT_LEFT,
-            AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN,
-            I2S_STD_SLOT_LEFT);
+            AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
 #else
         static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
