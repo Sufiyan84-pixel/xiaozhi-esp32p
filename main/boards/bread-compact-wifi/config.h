@@ -4,9 +4,9 @@
 #include <driver/gpio.h>
 
 #define AUDIO_INPUT_SAMPLE_RATE  16000
-#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
 
-// å¦‚æžœä½¿ç”¨ Duplex I2S æ¨¡å¼ï¼Œè¯·æ³¨é‡Šä¸‹é¢ä¸€è¡Œ
+// 如果使用 Duplex I2S 模式，请注释下面一行
 #define AUDIO_I2S_METHOD_SIMPLEX
 
 #ifdef AUDIO_I2S_METHOD_SIMPLEX
