@@ -14,16 +14,25 @@
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
-#ifdef SH1106
+// 1 = SH1106 driver (1.3" OLED), 0 = SSD1306 driver (0.96" OLED)
+// Agar display par text 2 pixel khisak ke dikhe ya garbled ho, ye value badal do.
+#ifndef OLED_USE_SH1106
+#define OLED_USE_SH1106 1
+#endif
+
+#if OLED_USE_SH1106
 #include <esp_lcd_panel_sh1106.h>
 #endif
 
 #define TAG "CompactWifiBoard"
+#define OLED_I2C_SPEED_HZ   (100 * 1000)
 
 class CompactWifiBoard : public WifiBoard {
 private:
-    i2c_master_bus_handle_t display_i2c_bus_;
+    i2c_master_bus_handle_t display_i2c_bus_ = nullptr;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     Display* display_ = nullptr;
@@ -46,13 +55,58 @@ private:
             },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &display_i2c_bus_));
+        ESP_LOGI(TAG, "I2C bus initialized (SDA=%d, SCL=%d, speed=%d Hz)",
+                 DISPLAY_SDA_PIN, DISPLAY_SCL_PIN, OLED_I2C_SPEED_HZ);
+    }
+
+    // ---------- Address Detection ----------
+    // FIX: ESP-IDF i2c_master_probe() aur dev_addr dono 7-bit address lete hain.
+    // Pehle code address ko <<1 karke (8-bit) bhej raha tha, isliye real OLED
+    // (0x3C) mil hi nahi raha tha. Ab seedha 7-bit address use hota hai.
+    uint8_t DetectDisplayAddress() {
+        const uint8_t candidates[] = { 0x3C, 0x3D };
+
+        // OLED ko power-up ke baad thoda time do, aur kuch baar retry karo
+        vTaskDelay(pdMS_TO_TICKS(100));
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            for (uint8_t addr : candidates) {
+                if (i2c_master_probe(display_i2c_bus_, addr, 100) == ESP_OK) {
+                    ESP_LOGI(TAG, "Display detected at 7-bit address 0x%02X (attempt %d)",
+                             addr, attempt);
+                    return addr;
+                }
+            }
+            ESP_LOGW(TAG, "No display found (attempt %d/5)", attempt);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+        ESP_LOGE(TAG, "No OLED found at 0x3C / 0x3D!");
+        ESP_LOGI(TAG, "Performing full I2C bus scan for debugging...");
+        bool found_any = false;
+        for (uint8_t a = 1; a < 127; a++) {
+            if (i2c_master_probe(display_i2c_bus_, a, 50) == ESP_OK) {
+                ESP_LOGI(TAG, "  I2C device found -> 7-bit: 0x%02X", a);
+                found_any = true;
+            }
+        }
+        if (!found_any) {
+            ESP_LOGE(TAG, "I2C bus is empty. Check SDA(GPIO%d)/SCL(GPIO%d) wiring and 3V3 power.",
+                     DISPLAY_SDA_PIN, DISPLAY_SCL_PIN);
+        }
+        return 0;
     }
 
     void InitializeSsd1306Display() {
-        // SSD1306 config
+        uint8_t dev_addr = DetectDisplayAddress();
+        if (dev_addr == 0) {
+            ESP_LOGE(TAG, "Display not available, using NoDisplay fallback.");
+            display_ = new NoDisplay();
+            return;
+        }
+
         esp_lcd_panel_io_i2c_config_t io_config = {
-            .dev_addr = 0x3C,
-            .scl_speed_hz = 400 * 1000,
+            .dev_addr = dev_addr,   // 7-bit address
+            .scl_speed_hz = OLED_I2C_SPEED_HZ,
             .control_phase_bytes = 1,
             .dc_bit_offset = 6,
             .lcd_cmd_bits = 8,
@@ -65,9 +119,13 @@ private:
             },
         };
 
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(display_i2c_bus_, &io_config, &panel_io_));
+        esp_err_t io_ret = esp_lcd_new_panel_io_i2c(display_i2c_bus_, &io_config, &panel_io_);
+        if (io_ret != ESP_OK) {
+            ESP_LOGE(TAG, "esp_lcd_new_panel_io_i2c failed: 0x%x", io_ret);
+            display_ = new NoDisplay();
+            return;
+        }
 
-        ESP_LOGI(TAG, "Install SSD1306 driver");
         esp_lcd_panel_dev_config_t panel_config = {};
         panel_config.reset_gpio_num = GPIO_NUM_NC;
         panel_config.bits_per_pixel = 1;
@@ -77,27 +135,48 @@ private:
         };
         panel_config.vendor_config = &ssd1306_config;
 
-#ifdef SH1106
-        ESP_ERROR_CHECK(esp_lcd_new_panel_sh1106(panel_io_, &panel_config, &panel_));
+#if OLED_USE_SH1106
+        const char* drv_name = "SH1106";
+        ESP_LOGI(TAG, "Install OLED driver (%s)", drv_name);
+        esp_err_t pnl_ret = esp_lcd_new_panel_sh1106(panel_io_, &panel_config, &panel_);
 #else
-        ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(panel_io_, &panel_config, &panel_));
+        const char* drv_name = "SSD1306";
+        ESP_LOGI(TAG, "Install OLED driver (%s)", drv_name);
+        esp_err_t pnl_ret = esp_lcd_new_panel_ssd1306(panel_io_, &panel_config, &panel_);
 #endif
-        ESP_LOGI(TAG, "SSD1306 driver installed");
+        if (pnl_ret != ESP_OK) {
+            ESP_LOGE(TAG, "esp_lcd_new_panel_%s failed: 0x%x", drv_name, pnl_ret);
+            display_ = new NoDisplay();
+            return;
+        }
+        ESP_LOGI(TAG, "%s driver installed", drv_name);
 
-        // Reset the display
-        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_));
+        // FIX: ESP_ERROR_CHECK ki jagah soft-fail, taaki OLED mein koi bhi
+        // problem aaye to device crash/reboot-loop mein na jaye.
+        if (esp_lcd_panel_reset(panel_) != ESP_OK) {
+            ESP_LOGE(TAG, "Display reset failed");
+            display_ = new NoDisplay();
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+
         if (esp_lcd_panel_init(panel_) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to initialize display");
             display_ = new NoDisplay();
             return;
         }
-        ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_, false));
+        esp_lcd_panel_invert_color(panel_, false);
 
-        // Set the display to on
         ESP_LOGI(TAG, "Turning display on");
-        ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
+        if (esp_lcd_panel_disp_on_off(panel_, true) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to turn display on");
+            display_ = new NoDisplay();
+            return;
+        }
 
-        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                   DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        ESP_LOGI(TAG, "OLED initialized successfully!");
     }
 
     void InitializeButtons() {
@@ -119,35 +198,27 @@ private:
         volume_up_button_.OnClick([this]() {
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() + 10;
-            if (volume > 100) {
-                volume = 100;
-            }
+            if (volume > 100) volume = 100;
             codec->SetOutputVolume(volume);
             GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         });
-
         volume_up_button_.OnLongPress([this]() {
             GetAudioCodec()->SetOutputVolume(100);
             GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });
-
         volume_down_button_.OnClick([this]() {
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() - 10;
-            if (volume < 0) {
-                volume = 0;
-            }
+            if (volume < 0) volume = 0;
             codec->SetOutputVolume(volume);
             GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         });
-
         volume_down_button_.OnLongPress([this]() {
             GetAudioCodec()->SetOutputVolume(0);
             GetDisplay()->ShowNotification(Lang::Strings::MUTED);
         });
     }
 
-    // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
     }
@@ -172,7 +243,8 @@ public:
     virtual AudioCodec* GetAudioCodec() override {
 #ifdef AUDIO_I2S_METHOD_SIMPLEX
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
+            AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT,
+            AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
 #else
         static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
