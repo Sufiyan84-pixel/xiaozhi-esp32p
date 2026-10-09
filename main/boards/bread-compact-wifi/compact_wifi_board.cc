@@ -59,14 +59,9 @@ private:
                  DISPLAY_SDA_PIN, DISPLAY_SCL_PIN, OLED_I2C_SPEED_HZ);
     }
 
-    // ---------- Address Detection ----------
-    // FIX: ESP-IDF i2c_master_probe() aur dev_addr dono 7-bit address lete hain.
-    // Pehle code address ko <<1 karke (8-bit) bhej raha tha, isliye real OLED
-    // (0x3C) mil hi nahi raha tha. Ab seedha 7-bit address use hota hai.
     uint8_t DetectDisplayAddress() {
         const uint8_t candidates[] = { 0x3C, 0x3D };
 
-        // OLED ko power-up ke baad thoda time do, aur kuch baar retry karo
         vTaskDelay(pdMS_TO_TICKS(100));
         for (int attempt = 1; attempt <= 5; attempt++) {
             for (uint8_t addr : candidates) {
@@ -105,7 +100,7 @@ private:
         }
 
         esp_lcd_panel_io_i2c_config_t io_config = {
-            .dev_addr = dev_addr,   // 7-bit address
+            .dev_addr = dev_addr,
             .scl_speed_hz = OLED_I2C_SPEED_HZ,
             .control_phase_bytes = 1,
             .dc_bit_offset = 6,
@@ -151,8 +146,6 @@ private:
         }
         ESP_LOGI(TAG, "%s driver installed", drv_name);
 
-        // FIX: ESP_ERROR_CHECK ki jagah soft-fail, taaki OLED mein koi bhi
-        // problem aaye to device crash/reboot-loop mein na jaye.
         if (esp_lcd_panel_reset(panel_) != ESP_OK) {
             ESP_LOGE(TAG, "Display reset failed");
             display_ = new NoDisplay();
@@ -188,11 +181,18 @@ private:
             }
             app.ToggleChatState();
         });
+
         touch_button_.OnPressDown([this]() {
             Application::GetInstance().StartListening();
+            if (display_) {
+                display_->ShowNotification("(^_^) Sun raha hoon...");
+            }
         });
         touch_button_.OnPressUp([this]() {
             Application::GetInstance().StopListening();
+            if (display_) {
+                display_->ShowNotification("(o_o) Ruk gaya");
+            }
         });
 
         volume_up_button_.OnClick([this]() {
@@ -200,22 +200,30 @@ private:
             auto volume = codec->output_volume() + 10;
             if (volume > 100) volume = 100;
             codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+            if (display_) {
+                display_->ShowNotification("(^_^) Volume: " + std::to_string(volume));
+            }
         });
         volume_up_button_.OnLongPress([this]() {
             GetAudioCodec()->SetOutputVolume(100);
-            GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
+            if (display_) {
+                display_->ShowNotification("(^o^) Max Volume!");
+            }
         });
         volume_down_button_.OnClick([this]() {
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() - 10;
             if (volume < 0) volume = 0;
             codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+            if (display_) {
+                display_->ShowNotification("(-_-) Volume: " + std::to_string(volume));
+            }
         });
         volume_down_button_.OnLongPress([this]() {
             GetAudioCodec()->SetOutputVolume(0);
-            GetDisplay()->ShowNotification(Lang::Strings::MUTED);
+            if (display_) {
+                display_->ShowNotification("(x_x) Muted");
+            }
         });
     }
 
@@ -244,7 +252,9 @@ public:
 #ifdef AUDIO_I2S_METHOD_SIMPLEX
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT,
-            AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
+            I2S_STD_SLOT_LEFT,
+            AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN,
+            I2S_STD_SLOT_LEFT);
 #else
         static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
