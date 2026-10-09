@@ -249,7 +249,7 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
 
     samples = bytes_read / sizeof(int32_t);
     for (int i = 0; i < samples; i++) {
-        // INMP441 24-bit data, shift by 6 to amplify (was 8/10/12)
+        // INMP441 24-bit data, shift by 6 for high sensitivity
         int32_t value = bit32_buffer[i] >> 6;
         dest[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
     }
