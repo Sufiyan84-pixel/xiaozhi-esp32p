@@ -1,11 +1,19 @@
 #include "no_audio_codec.h"
 
 #include <esp_log.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #define TAG "NoAudioCodec"
+
+// 1 = boot par ek baar speaker mein 1 kHz ki beep bajegi (speaker/amp ka hardware test).
+// Beep sunai de -> speaker + amp + wiring sahi hain. Na aaye -> hardware problem.
+// Test ho jaye to 0 kar do.
+#define SPEAKER_SELFTEST_BEEP 1
 
 NoAudioCodec::~NoAudioCodec() {
     if (rx_handle_ != nullptr) {
@@ -135,15 +143,17 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
 int NoAudioCodec::Write(const int16_t* data, int samples) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
 
-    // ---- DEBUG: Speaker ko data mil raha hai ya nahi ----
+    // ---- DEBUG: Speaker ko asli audio mil raha hai ya nahi ----
+    // peak_since = pichle log ke baad ka sabse bada sample (sirf ek block ka nahi)
     static int write_count = 0;
+    static int32_t peak_since = 0;
+    for (int i = 0; i < samples; i++) {
+        int32_t abs_val = abs(data[i]);
+        if (abs_val > peak_since) peak_since = abs_val;
+    }
     if (write_count++ % 100 == 0) {
-        int32_t max_val = 0;
-        for (int i = 0; i < samples; i++) {
-            int32_t abs_val = abs(data[i]);
-            if (abs_val > max_val) max_val = abs_val;
-        }
-        ESP_LOGI(TAG, "SPK write: samples=%d, max=%ld, vol=%d", samples, (long)max_val, output_volume_);
+        ESP_LOGI(TAG, "SPK write: samples=%d, peak=%ld, vol=%d", samples, (long)peak_since, output_volume_);
+        peak_since = 0;
     }
 
     std::vector<int32_t> buffer(samples);
@@ -181,21 +191,74 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
 
     samples = bytes_read / sizeof(int32_t);
 
-    // ---- DEBUG: Mic raw data ----
+    // ---- Mic processing: glitch filter + DC remove + auto gain (AGC) ----
+    // (Read sirf ek hi audio task se call hota hai, isliye static state safe hai)
+    static int32_t dc_est = 0;       // DC offset estimate (24-bit units)
+    static int32_t prev_v = 0;       // pichla sahi sample
+    static int glitch_run = 0;       // lagatar kitne sample glitch mane gaye
+    static float gain = 8.0f;        // AGC gain (1.0 = no gain)
     static int read_count = 0;
-    if (read_count++ % 100 == 0) {
-        int32_t max_val = 0;
-        for (int i = 0; i < samples; i++) {
-            int32_t abs_val = abs(bit32_buffer[i]);
-            if (abs_val > max_val) max_val = abs_val;
-        }
-        ESP_LOGI(TAG, "MIC raw: max=%ld (samples=%d)", (long)max_val, samples);
-    }
+    static int glitch_total = 0;
+
+    constexpr int32_t kGlitchJump = 3000000;  // ek sample mein itna bada jump = noise/bit-error
+    constexpr float kTargetPeak = 9000.0f;    // output ka target peak (16-bit)
+    constexpr float kMinGain = 0.5f;
+    constexpr float kMaxGain = 40.0f;         // zyada awaaz chahiye to ye badhao
+    constexpr float kNoiseFloor = 40.0f;      // isse dheemi awaaz = chup, gain mat badhao
+
+    int32_t raw_max = 0;
+    int32_t block_peak = 0;                   // cleaned peak (24-bit units)
 
     for (int i = 0; i < samples; i++) {
-        // INMP441 24-bit: >> 6 for server (reply aayega)
-        int32_t value = bit32_buffer[i] >> 6;
-        dest[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
+        int32_t r = bit32_buffer[i];
+        int32_t ar = (r == INT32_MIN) ? INT32_MAX : (r < 0 ? -r : r);
+        if (ar > raw_max) raw_max = ar;
+
+        int32_t v = r >> 8;                   // 32-bit slot -> 24-bit signed sample
+
+        int32_t jump = v - prev_v;
+        if (jump < 0) jump = -jump;
+        if (jump > kGlitchJump && glitch_run < 8) {
+            v = prev_v;                       // glitch: pichla sample hold karo
+            glitch_run++;
+            glitch_total++;
+        } else {
+            glitch_run = 0;
+        }
+        prev_v = v;
+
+        dc_est += (v - dc_est) / 256;         // slow DC tracker (~10 Hz high-pass)
+        int32_t y = v - dc_est;
+        bit32_buffer[i] = y;
+
+        int32_t ay = y < 0 ? -y : y;
+        if (ay > block_peak) block_peak = ay;
+    }
+
+    float peak16 = block_peak / 256.0f;       // gain ke bina peak (16-bit units)
+    if (samples > 0) {
+        if (peak16 * gain > kTargetPeak) {
+            gain = kTargetPeak / (peak16 > 1.0f ? peak16 : 1.0f);   // tez attack
+        } else if (peak16 > kNoiseFloor && peak16 * gain < kTargetPeak * 0.8f) {
+            gain *= 1.03f;                                          // dheema release
+        }
+        if (gain < kMinGain) gain = kMinGain;
+        if (gain > kMaxGain) gain = kMaxGain;
+    }
+
+    const float scale = gain / 256.0f;
+    for (int i = 0; i < samples; i++) {
+        float f = (float)bit32_buffer[i] * scale;
+        if (f > 32767.0f) f = 32767.0f;
+        if (f < -32767.0f) f = -32767.0f;
+        dest[i] = (int16_t)f;
+    }
+
+    // ---- DEBUG: Mic status (har ~1 second) ----
+    if (read_count++ % 100 == 0) {
+        ESP_LOGI(TAG, "MIC raw max=%ld, clean peak=%d, gain x10=%d, glitches=%d",
+                 (long)raw_max, (int)peak16, (int)(gain * 10.0f), glitch_total);
+        glitch_total = 0;
     }
     return samples;
 }
@@ -213,12 +276,41 @@ void NoAudioCodec::EnableInput(bool enable) {
     AudioCodec::EnableInput(enable);
 }
 
+#if SPEAKER_SELFTEST_BEEP
+// Speaker hardware test: seedha I2S par 1 kHz ki ~0.3 sec beep (server/volume se independent)
+static void PlaySelfTestBeep(i2s_chan_handle_t tx, int sample_rate) {
+    constexpr int kChunk = 480;
+    const int total = sample_rate / 3;
+    const float amp = 0.25f * 2147483647.0f;
+    std::vector<int32_t> buf(kChunk);
+    ESP_LOGI(TAG, "Speaker self-test beep (1 kHz)...");
+    int n = 0;
+    while (n < total) {
+        int len = std::min(kChunk, total - n);
+        for (int i = 0; i < len; i++) {
+            buf[i] = (int32_t)(amp * std::sin(2.0f * 3.14159265f * 1000.0f * (float)(n + i) / (float)sample_rate));
+        }
+        size_t written = 0;
+        i2s_channel_write(tx, buf.data(), len * sizeof(int32_t), &written, 1000);
+        n += len;
+    }
+    ESP_LOGI(TAG, "Self-test beep done");
+}
+#endif
+
 void NoAudioCodec::EnableOutput(bool enable) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
     if (enable == output_enabled_) return;
     if (enable) {
         ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
         ESP_LOGI(TAG, "SPK enabled");
+#if SPEAKER_SELFTEST_BEEP
+        static bool beep_done = false;
+        if (!beep_done) {
+            beep_done = true;
+            PlaySelfTestBeep(tx_handle_, output_sample_rate_);
+        }
+#endif
     } else {
         ESP_ERROR_CHECK(i2s_channel_disable(tx_handle_));
         ESP_LOGI(TAG, "SPK disabled");
