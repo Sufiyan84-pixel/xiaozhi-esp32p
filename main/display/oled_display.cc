@@ -475,4 +475,4 @@ void OledDisplay::SetPowerSaveMode(bool on) {
         }
     }
     LvglDisplay::SetPowerSaveMode(on);
-}
+} 
