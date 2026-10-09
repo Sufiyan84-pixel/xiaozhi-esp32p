@@ -38,6 +38,9 @@ public:
     virtual void SetTheme(Theme* theme) override;
     virtual bool IsMonochrome() const override { return true; }
     void SetPowerSaveMode(bool on) override;
+
+    // === Premium Idle Screen ===
+    void ShowPremiumIdleScreen();
 };
 
 #endif  // OLED_DISPLAY_H
