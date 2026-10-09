@@ -82,19 +82,15 @@ OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handl
         ESP_LOGE(TAG, "Failed to add display");
         return;
     }
-
-    // Note: SetupUI() should be called by Application::Initialize(), not in constructor
-    // to ensure lvgl objects are created after the display is fully initialized.
 }
 
 void OledDisplay::SetupUI() {
-    // Prevent duplicate calls - if already called, return early
     if (setup_ui_called_) {
         ESP_LOGW(TAG, "SetupUI() called multiple times, skipping duplicate call");
         return;
     }
 
-    Display::SetupUI();  // Mark SetupUI as called
+    Display::SetupUI();
     if (height_ == 64) {
         SetupUI_128x64();
     } else {
@@ -152,7 +148,6 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
         return;
     }
 
-    // Replace all newlines with spaces
     std::string content_str = content;
     std::replace(content_str.begin(), content_str.end(), '\n', ' ');
 
@@ -165,6 +160,17 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
         } else {
             lv_label_set_text(chat_message_label_, content_str.c_str());
             lv_obj_remove_flag(content_right_, LV_OBJ_FLAG_HIDDEN);
+
+            // Premium: fade-in animation for new message
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, content_right_);
+            lv_anim_set_values(&a, 0, 255);
+            lv_anim_set_duration(&a, 250);
+            lv_anim_set_exec_cb(&a, [](void* obj, int32_t value) {
+                lv_obj_set_style_opa((lv_obj_t*)obj, value, 0);
+            });
+            lv_anim_start(&a);
         }
     }
 }
@@ -226,12 +232,12 @@ void OledDisplay::SetupUI_128x64() {
     status_bar_ = lv_obj_create(screen);
     lv_obj_set_size(status_bar_, LV_HOR_RES, 16);
     lv_obj_set_style_radius(status_bar_, 0, 0);
-    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);  // Transparent background
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(status_bar_, 0, 0);
     lv_obj_set_style_pad_all(status_bar_, 0, 0);
     lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);  // Use absolute positioning
-    lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);        // Overlap with top_bar_
+    lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);
+    lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);
 
     notification_label_ = lv_label_create(status_bar_);
     lv_obj_set_width(notification_label_, LV_HOR_RES);
@@ -315,7 +321,6 @@ void OledDisplay::SetupUI_128x32() {
     auto screen = lv_screen_active();
     lv_obj_set_style_text_font(screen, text_font, 0);
 
-    /* Container */
     container_ = lv_obj_create(screen);
     lv_obj_set_size(container_, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_flex_flow(container_, LV_FLEX_FLOW_ROW);
@@ -323,7 +328,6 @@ void OledDisplay::SetupUI_128x32() {
     lv_obj_set_style_border_width(container_, 0, 0);
     lv_obj_set_style_pad_column(container_, 0, 0);
 
-    /* Emotion label on the left side */
     content_ = lv_obj_create(container_);
     lv_obj_set_size(content_, 32, 32);
     lv_obj_set_style_pad_all(content_, 0, 0);
@@ -335,7 +339,6 @@ void OledDisplay::SetupUI_128x32() {
     lv_label_set_text(emotion_label_, MATERIAL_SYMBOLS_ROBOT_2);
     lv_obj_center(emotion_label_);
 
-    /* Right side */
     side_bar_ = lv_obj_create(container_);
     lv_obj_set_size(side_bar_, width_ - 32, 32);
     lv_obj_set_flex_flow(side_bar_, LV_FLEX_FLOW_COLUMN);
@@ -344,7 +347,6 @@ void OledDisplay::SetupUI_128x32() {
     lv_obj_set_style_radius(side_bar_, 0, 0);
     lv_obj_set_style_pad_row(side_bar_, 0, 0);
 
-    /* Status bar */
     status_bar_ = lv_obj_create(side_bar_);
     lv_obj_set_size(status_bar_, width_ - 32, 16);
     lv_obj_set_style_radius(status_bar_, 0, 0);
@@ -382,7 +384,6 @@ void OledDisplay::SetupUI_128x32() {
     lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_label_set_text(chat_message_label_, "");
 
-    // Start scrolling subtitle after a delay
     static lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_delay(&a, 1000);
@@ -392,6 +393,9 @@ void OledDisplay::SetupUI_128x32() {
                                    LV_PART_MAIN);
 }
 
+// ============================================================================
+//  SetEmotion - Premium Cute Face with Animation
+// ============================================================================
 void OledDisplay::SetEmotion(const char* emotion) {
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     const char* utf8 = noto_emoji_get_utf8(emotion);
@@ -407,6 +411,29 @@ void OledDisplay::SetEmotion(const char* emotion) {
     if (utf8 != nullptr) {
         lv_obj_set_style_text_font(emotion_label_, emotion_font, 0);
         lv_label_set_text(emotion_label_, utf8);
+
+        // ---- Premium animation: pop + fade ----
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, emotion_label_);
+        lv_anim_set_values(&a, 0, 255);
+        lv_anim_set_duration(&a, 200);
+        lv_anim_set_exec_cb(&a, [](void* obj, int32_t value) {
+            lv_obj_set_style_opa((lv_obj_t*)obj, value, 0);
+        });
+        lv_anim_start(&a);
+
+        // Scale pop
+        lv_anim_t scale_anim;
+        lv_anim_init(&scale_anim);
+        lv_anim_set_var(&scale_anim, emotion_label_);
+        lv_anim_set_values(&scale_anim, 200, 256);
+        lv_anim_set_duration(&scale_anim, 250);
+        lv_anim_set_exec_cb(&scale_anim, [](void* obj, int32_t value) {
+            lv_obj_set_style_transform_scale((lv_obj_t*)obj, value, 0);
+        });
+        lv_anim_start(&scale_anim);
+
     } else {
         lv_obj_set_style_text_font(emotion_label_, lvgl_theme->emoji_font()->font(), 0);
         lv_label_set_text(emotion_label_, NOTO_EMOJI_NEUTRAL);
