@@ -71,6 +71,11 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
 
+    ESP_LOGI(TAG, "=== Simplex Audio Init ===");
+    ESP_LOGI(TAG, "Input rate: %d Hz, Output rate: %d Hz", input_sample_rate_, output_sample_rate_);
+    ESP_LOGI(TAG, "SPK: BCLK=%d, WS=%d, DOUT=%d", spk_bclk, spk_ws, spk_dout);
+    ESP_LOGI(TAG, "MIC: SCK=%d, WS=%d, DIN=%d", mic_sck, mic_ws, mic_din);
+
     // Speaker channel
     i2s_chan_config_t chan_cfg = {
         .id = XIAOZHI_I2S_PORT(0),
@@ -112,6 +117,7 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
         }
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
+    ESP_LOGI(TAG, "Speaker channel initialized");
 
     // Mic channel
     chan_cfg.id = XIAOZHI_I2S_PORT(1);
@@ -122,14 +128,27 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
     std_cfg.gpio_cfg.din = mic_din;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
-    ESP_LOGI(TAG, "Simplex channels created");
+    ESP_LOGI(TAG, "Mic channel initialized");
+    ESP_LOGI(TAG, "=== Simplex channels created ===");
 }
 
 int NoAudioCodec::Write(const int16_t* data, int samples) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
-    std::vector<int32_t> buffer(samples);
 
+    // Debug: Speaker output
+    static int write_counter = 0;
+    if (write_counter++ % 100 == 0) {
+        int32_t max_val = 0;
+        for (int i = 0; i < samples; i++) {
+            int32_t abs_val = abs(data[i]);
+            if (abs_val > max_val) max_val = abs_val;
+        }
+        ESP_LOGI(TAG, "SPK write: samples=%d, max=%ld, vol=%d", samples, (long)max_val, output_volume_);
+    }
+
+    std::vector<int32_t> buffer(samples);
     int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
+
     for (int i = 0; i < samples; i++) {
         int64_t temp = int64_t(data[i]) * volume_factor;
         if (temp > INT32_MAX) {
@@ -142,7 +161,11 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
     }
 
     size_t bytes_written;
-    ESP_ERROR_CHECK(i2s_channel_write(tx_handle_, buffer.data(), samples * sizeof(int32_t), &bytes_written, portMAX_DELAY));
+    esp_err_t ret = i2s_channel_write(tx_handle_, buffer.data(), samples * sizeof(int32_t), &bytes_written, portMAX_DELAY);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPK write failed: %d", ret);
+        return 0;
+    }
     return bytes_written / sizeof(int32_t);
 }
 
@@ -151,24 +174,27 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
     constexpr uint32_t kReadTimeoutMs = 200;
 
     std::vector<int32_t> bit32_buffer(samples);
-    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read, kReadTimeoutMs) != ESP_OK) {
+    esp_err_t ret = i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read, kReadTimeoutMs);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "MIC read failed: %d", ret);
         return 0;
     }
 
     samples = bytes_read / sizeof(int32_t);
 
-    // Debug: Mic se aane wale raw data ka maximum value print karo
-    static int debug_counter = 0;
-    if (debug_counter++ % 100 == 0) {
+    // Debug: Mic raw data
+    static int read_counter = 0;
+    if (read_counter++ % 100 == 0) {
         int32_t max_val = 0;
         for (int i = 0; i < samples; i++) {
             int32_t abs_val = abs(bit32_buffer[i]);
             if (abs_val > max_val) max_val = abs_val;
         }
-        ESP_LOGI(TAG, "Mic raw max: %ld (0 = no data, >1000 = data aa raha hai)", (long)max_val);
+        ESP_LOGI(TAG, "MIC raw: max=%ld (samples=%d)", (long)max_val, samples);
     }
 
     for (int i = 0; i < samples; i++) {
+        // INMP441 24-bit: >> 6 for server (reply aayega), debugging ke liye
         int32_t value = bit32_buffer[i] >> 6;
         dest[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
     }
@@ -177,26 +203,26 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
 
 void NoAudioCodec::EnableInput(bool enable) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
-    if (enable == input_enabled_) {
-        return;
-    }
+    if (enable == input_enabled_) return;
     if (enable) {
         ESP_ERROR_CHECK(i2s_channel_enable(rx_handle_));
+        ESP_LOGI(TAG, "MIC enabled");
     } else {
         ESP_ERROR_CHECK(i2s_channel_disable(rx_handle_));
+        ESP_LOGI(TAG, "MIC disabled");
     }
     AudioCodec::EnableInput(enable);
 }
 
 void NoAudioCodec::EnableOutput(bool enable) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
-    if (enable == output_enabled_) {
-        return;
-    }
+    if (enable == output_enabled_) return;
     if (enable) {
         ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
+        ESP_LOGI(TAG, "SPK enabled");
     } else {
         ESP_ERROR_CHECK(i2s_channel_disable(tx_handle_));
+        ESP_LOGI(TAG, "SPK disabled");
     }
     AudioCodec::EnableOutput(enable);
 }
