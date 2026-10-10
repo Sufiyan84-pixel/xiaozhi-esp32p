@@ -65,12 +65,10 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
-    // Setup the display
     auto display = board.GetDisplay();
     display->SetupUI();
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
-    // Setup the audio service
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
@@ -162,7 +160,6 @@ void Application::Initialize() {
     board.StartNetwork();
     display->UpdateStatusBar(true);
 
-    // NTP Setup (network start ke BAAD)
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_setservername(1, "time.google.com");
@@ -268,7 +265,7 @@ void Application::Run() {
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
-            // Idle par premium screen dikhao
+            // === Idle par premium screen (robot face) ===
             if (GetDeviceState() == kDeviceStateIdle) {
                 auto* oled = static_cast<OledDisplay*>(display);
                 if (oled) {
