@@ -7,12 +7,15 @@
 #include "config.h"
 #include "mcp_server.h"
 #include "lamp_controller.h"
+#include "settings.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
+#include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <driver/ledc.h>
+#include <esp_timer.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <freertos/FreeRTOS.h>
@@ -27,9 +30,13 @@
 // ============================================================================
 //  Compact WiFi Board  -  Premium Edition
 //
-//   * Boot splash   : OLED par dithered fade-in / fade-out animation
-//   * Smooth lamp   : PWM + gamma + ease-in/out (soft on/off) + brightness control
-//   * Robust OLED   : 7-bit address detect + retry + soft-fail (crash nahi hoga)
+//   * Boot splash  : OLED par dithered fade-in, line sweep, tagline, voice-equalizer
+//                    animation, fade-out
+//   * Smooth lamp  : PWM + gamma + ease; effects (breathe / candle / heartbeat pulse),
+//                    sunrise (dheere dheere jalna), sleep timer (dheere dheere bujhna),
+//                    brightness / effect / on-off reboot ke baad bhi yaad rehta hai
+//   * Splash skip  : animation ke dauran BOOT dabao to turant skip
+//   * Robust OLED  : 7-bit address detect + retry + soft-fail (crash nahi hoga)
 // ============================================================================
 
 // ------------------------------ Tuning macros -------------------------------
@@ -40,9 +47,25 @@
 #define OLED_USE_SH1106 1
 #endif
 
-// 1 = boot par OLED animation chalegi (~2 sec). Garbled dikhe to 0 kar do.
+// 1 = OLED I2C 400 kHz (animation / UI 4x smooth). Agar display par kachra ya jhilmil
+// aaye to 0 kar do (jumper wire lambi ho to 100 kHz hi theek rehta hai).
+#ifndef OLED_I2C_FAST
+#define OLED_I2C_FAST 0
+#endif
+
+// 1 = boot par OLED animation chalegi (~2.5 sec). Garbled dikhe to neeche
+// SPLASH_ROW_MAJOR badal ke dekho, phir bhi na chale to 0 kar do.
 #ifndef BOOT_SPLASH
 #define BOOT_SPLASH 1
+#endif
+// Animation ka data format: 0 = page format (har byte = 8 vertical pixel, SSD1306 jaisa),
+// 1 = row format (har byte = 8 horizontal pixel). Animation ulti-seedhi ya kachra dikhe to badlo.
+#ifndef SPLASH_ROW_MAJOR
+#define SPLASH_ROW_MAJOR 0
+#endif
+// 1 = animation ke dauran BOOT button dabane par animation turant skip ho jayegi
+#ifndef SPLASH_SKIP_ON_BUTTON
+#define SPLASH_SKIP_ON_BUTTON 1
 #endif
 #define SPLASH_NAME     "ALIYA"             // sirf A-Z aur space
 #define SPLASH_TAGLINE  "VOICE ASSISTANT"   // sirf A-Z aur space
@@ -51,6 +74,10 @@
 // DHYAN: agar lamp RELAY se chal rahi hai to ise 0 rakho (relay PWM se kharab hota hai).
 #ifndef LAMP_SMOOTH_FADE
 #define LAMP_SMOOTH_FADE 1
+#endif
+// 1 = lamp ki brightness, effect aur on/off yaad rakhegi (reboot ke baad wahi se shuru)
+#ifndef LAMP_REMEMBER_STATE
+#define LAMP_REMEMBER_STATE 1
 #endif
 // 1 = lamp active-low hai (GPIO LOW par jalti hai)
 #ifndef LAMP_ACTIVE_LOW
@@ -62,10 +89,14 @@
 #endif
 
 #define TAG "CompactWifiBoard"
+#if OLED_I2C_FAST
+#define OLED_I2C_SPEED_HZ   (400 * 1000)
+#else
 #define OLED_I2C_SPEED_HZ   (100 * 1000)
+#endif
 
 // ============================================================================
-//  SMOOTH LAMP  (PWM + gamma 2.2 + exponential ease)
+//  SMOOTH LAMP  (PWM + gamma 2.2 + ease, effects, sunrise, sleep timer)
 // ============================================================================
 #if LAMP_SMOOTH_FADE
 class SmoothLamp {
@@ -89,10 +120,98 @@ public:
         ch.hpoint = 0;
         ESP_ERROR_CHECK(ledc_channel_config(&ch));
 
-        xTaskCreate(&SmoothLamp::TaskEntry, "lamp_fade", 3072, this, 3, &task_);
+        xTaskCreate(&SmoothLamp::TaskEntry, "lamp_fade", 4096, this, 3, &task_);
         RegisterTools();
+#if LAMP_REMEMBER_STATE
+        Restore();
+#endif
         ESP_LOGI(TAG, "💡 Smooth lamp ready (GPIO %d)", (int)gpio_);
     }
+
+    // Ek animation tick (now_ms = abhi ka time). true = abhi kuch chal raha hai, 10 ms baad dobara.
+    // (Task isse chalata hai; public isliye ki test mein bhi chal sake.)
+    bool Tick(int64_t now_ms) {
+        const bool on = on_.load();
+        float target = on ? brightness_.load() / 100.0f : 0.0f;
+        bool fast = false;   // effect / sunrise / sleep-fade: roshni target ke peeche tezi se chale
+        float fast_tau = 45.0f;
+        bool keep = false;   // timer chal raha hai: tick band mat karo
+
+        if (on) {
+            // --- sunrise: 0 se dheere dheere poori roshni (smoothstep) ---
+            int64_t rd = ramp_dur_ms_.load();
+            if (rd > 0) {
+                float p = (float)(now_ms - ramp_start_ms_.load()) / (float)rd;
+                if (p >= 1.0f) {
+                    ramp_dur_ms_.store(0);
+                } else {
+                    if (p < 0.0f) p = 0.0f;
+                    target *= p * p * (3.0f - 2.0f * p);
+                    fast = true;
+                    keep = true;
+                }
+            }
+            // --- sleep timer: aakhri hisse mein dheere dheere bujhna ---
+            int64_t dl = sleep_deadline_ms_.load();
+            if (dl > 0) {
+                int64_t remaining = dl - now_ms;
+                if (remaining <= 0) {
+                    on_.store(false);
+                    sleep_deadline_ms_.store(0);
+                    dirty_.store(true);          // Run() isse NVS mein save karega
+                    target = 0.0f;
+                } else {
+                    int64_t fade = sleep_fade_ms_.load();
+                    if (fade < 1) fade = 1;
+                    if (remaining < fade) {
+                        target *= (float)remaining / (float)fade;
+                        fast = true;
+                    }
+                    keep = true;
+                }
+            }
+            // --- effects ---
+            const int fx = effect_.load();
+            if (fx != 0) {
+                float m = 1.0f;
+                const float t = (float)now_ms / 1000.0f;
+                if (fx == 1) {            // breathe: 4 sec ki saans
+                    m = 0.30f + 0.70f * (0.5f - 0.5f * std::cos(2.0f * 3.14159265f * t / 4.0f));
+                } else if (fx == 2) {     // candle: naram random jhilmil
+                    if (now_ms >= next_flick_ms_) {
+                        next_flick_ms_ = now_ms + 60 + (int64_t)(NextRand() % 90);
+                        flick_target_ = 0.55f + 0.45f * ((float)(NextRand() % 1000) / 1000.0f);
+                    }
+                    flick_ += (flick_target_ - flick_) * 0.12f;
+                    m = flick_;
+                } else if (fx == 3) {     // heartbeat pulse: dhak-dhak
+                    float p = std::fmod(t, 1.4f);
+                    float b1 = std::exp(-std::pow((p - 0.10f) / 0.07f, 2.0f));
+                    float b2 = 0.7f * std::exp(-std::pow((p - 0.38f) / 0.09f, 2.0f));
+                    float v = b1 + b2;
+                    if (v > 1.0f) v = 1.0f;
+                    m = 0.25f + 0.75f * v;
+                    fast_tau = 18.0f;         // dhak-dhak tez chahiye
+                }
+                target *= m;
+                fast = true;
+                keep = true;
+            }
+        }
+
+        float diff = target - level_;
+        if (!fast && std::fabs(diff) < 0.004f) {
+            level_ = target;
+            Apply();
+            return keep;
+        }
+        float tau = fast ? fast_tau : (diff > 0.0f ? kFadeInTauMs : kFadeOutTauMs);
+        level_ += diff * (1.0f - std::exp(-(float)kStepMs / tau));
+        Apply();
+        return true;
+    }
+
+    float level() const { return level_; }
 
 private:
     static constexpr float kFadeInTauMs = 130.0f;    // on: ~0.7 sec
@@ -103,13 +222,32 @@ private:
     TaskHandle_t task_ = nullptr;
     std::atomic<bool> on_{false};
     std::atomic<int> brightness_{100};
+    std::atomic<int> effect_{0};                      // 0 steady, 1 breathe, 2 candle, 3 pulse
+    std::atomic<int64_t> ramp_start_ms_{0};
+    std::atomic<int64_t> ramp_dur_ms_{0};
+    std::atomic<int64_t> sleep_deadline_ms_{0};
+    std::atomic<int64_t> sleep_fade_ms_{60000};
+    std::atomic<bool> dirty_{false};
     float level_ = 0.0f;                              // abhi ki (perceptual) roshni 0..1
+    float flick_ = 0.8f;
+    float flick_target_ = 0.8f;
+    int64_t next_flick_ms_ = 0;
+    uint32_t rng_ = 2463534242u;
+
+    uint32_t NextRand() {                             // xorshift32
+        rng_ ^= rng_ << 13;
+        rng_ ^= rng_ >> 17;
+        rng_ ^= rng_ << 5;
+        return rng_;
+    }
+
+    static int64_t NowMs() { return esp_timer_get_time() / 1000; }
 
     static uint32_t DutyFor(float level) {
         constexpr uint32_t kMax = (1u << 10) - 1;
+        if (level < 0.0f) level = 0.0f;
+        if (level > 1.0f) level = 1.0f;
         float g = std::pow(level, 2.2f);              // gamma: aankh ko smooth lage
-        if (g < 0.0f) g = 0.0f;
-        if (g > 1.0f) g = 1.0f;
 #if LAMP_ACTIVE_LOW
         g = 1.0f - g;
 #endif
@@ -128,31 +266,63 @@ private:
     void Run() {
         for (;;) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-            for (;;) {
-                float target = on_.load() ? brightness_.load() / 100.0f : 0.0f;
-                float diff = target - level_;
-                if (std::fabs(diff) < 0.004f) {       // pahunch gaye
-                    level_ = target;
-                    Apply();
-                    break;
-                }
-                float tau = diff > 0.0f ? kFadeInTauMs : kFadeOutTauMs;
-                level_ += diff * (1.0f - std::exp(-(float)kStepMs / tau));
-                Apply();
+            while (Tick(NowMs())) {
                 vTaskDelay(pdMS_TO_TICKS(kStepMs));
             }
+            if (dirty_.exchange(false)) Save();
         }
+    }
+
+    void TurnOn() {
+        if (brightness_.load() <= 0) brightness_.store(100);
+        on_.store(true);
+    }
+
+    // brightness / effect / power NVS mein (sirf badalne par, isliye flash ghisega nahi)
+    void Save() {
+#if LAMP_REMEMBER_STATE
+        Settings settings("lamp", true);
+        settings.SetInt("brightness", brightness_.load());
+        settings.SetInt("effect", effect_.load());
+        settings.SetInt("power", on_.load() ? 1 : 0);
+#endif
+    }
+
+    void Restore() {
+        Settings settings("lamp", false);
+        int b = settings.GetInt("brightness", 100);
+        int e = settings.GetInt("effect", 0);
+        int p = settings.GetInt("power", 0);
+        if (b < 0) b = 0;
+        if (b > 100) b = 100;
+        if (e < 0 || e > 3) e = 0;
+        brightness_.store(b);
+        effect_.store(e);
+        if (p != 0 && b > 0) {
+            on_.store(true);
+            Kick();                       // boot par naram fade-in
+        }
+        ESP_LOGI(TAG, "💡 Lamp restored: power=%d brightness=%d effect=%d", p, b, e);
     }
 
     void RegisterTools() {
         auto& mcp_server = McpServer::GetInstance();
 
         mcp_server.AddTool("self.lamp.get_state",
-            "Get the power state and brightness (0-100) of the lamp",
+            "Get the lamp state: power, brightness (0-100), effect (0 steady, 1 breathe, "
+            "2 candle, 3 heartbeat pulse) and minutes left on the sleep timer",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
+                int64_t dl = sleep_deadline_ms_.load();
+                int left = 0;
+                if (dl > 0) {
+                    int64_t rem = dl - NowMs();
+                    if (rem > 0) left = (int)((rem + 59999) / 60000);
+                }
                 std::string s = std::string("{\"power\": ") + (on_.load() ? "true" : "false") +
-                                ", \"brightness\": " + std::to_string(brightness_.load()) + "}";
+                                ", \"brightness\": " + std::to_string(brightness_.load()) +
+                                ", \"effect\": " + std::to_string(effect_.load()) +
+                                ", \"sleep_minutes_left\": " + std::to_string(left) + "}";
                 return s;
             });
 
@@ -160,18 +330,21 @@ private:
             "Turn on the lamp with a smooth fade-in",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
-                if (brightness_.load() <= 0) brightness_.store(100);
-                on_.store(true);
+                TurnOn();
                 Kick();
+                Save();
                 return true;
             });
 
         mcp_server.AddTool("self.lamp.turn_off",
-            "Turn off the lamp with a smooth fade-out",
+            "Turn off the lamp with a smooth fade-out (also cancels sunrise and sleep timer)",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 on_.store(false);
+                ramp_dur_ms_.store(0);
+                sleep_deadline_ms_.store(0);
                 Kick();
+                Save();
                 return true;
             });
 
@@ -187,6 +360,67 @@ private:
                 brightness_.store(b);
                 on_.store(b > 0);
                 Kick();
+                Save();
+                return true;
+            });
+
+        mcp_server.AddTool("self.lamp.set_effect",
+            "Set a lamp light effect: 0 = steady, 1 = breathe (slow fade in and out), "
+            "2 = candle flicker, 3 = heartbeat pulse. Turns the lamp on if it is off",
+            PropertyList({
+                Property("effect", kPropertyTypeInteger, 0, 3)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int e = properties["effect"].value<int>();
+                if (e < 0) e = 0;
+                if (e > 3) e = 3;
+                effect_.store(e);
+                TurnOn();
+                Kick();
+                Save();
+                return true;
+            });
+
+        mcp_server.AddTool("self.lamp.sunrise",
+            "Wake-up light: slowly brighten the lamp from off to the current brightness over "
+            "the given number of minutes (1-60)",
+            PropertyList({
+                Property("minutes", kPropertyTypeInteger, 1, 60)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int m = properties["minutes"].value<int>();
+                if (m < 1) m = 1;
+                if (m > 60) m = 60;
+                TurnOn();
+                ramp_start_ms_.store(NowMs());
+                ramp_dur_ms_.store((int64_t)m * 60000);
+                Kick();
+                Save();
+                return true;
+            });
+
+        mcp_server.AddTool("self.lamp.sleep_timer",
+            "Sleep timer: keep the lamp on and then slowly dim it to off after the given "
+            "number of minutes (1-180). Use 0 to cancel the timer",
+            PropertyList({
+                Property("minutes", kPropertyTypeInteger, 0, 180)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int m = properties["minutes"].value<int>();
+                if (m < 0) m = 0;
+                if (m > 180) m = 180;
+                if (m == 0) {
+                    sleep_deadline_ms_.store(0);
+                } else {
+                    int64_t total = (int64_t)m * 60000;
+                    int64_t fade = total / 2;
+                    if (fade > 60000) fade = 60000;
+                    sleep_fade_ms_.store(fade);
+                    sleep_deadline_ms_.store(NowMs() + total);
+                    TurnOn();
+                }
+                Kick();
+                Save();
                 return true;
             });
     }
@@ -247,11 +481,16 @@ public:
         std::memset(name_layer_, 0, sizeof(name_layer_));
         std::memset(tag_layer_, 0, sizeof(tag_layer_));
         Layout();
+#if SPLASH_SKIP_ON_BUTTON
+        // Agar button shuru mein hi dabaa dikhe (ya pin galat padh raha ho) to skip band rakho
+        skip_enabled_ = gpio_get_level(BOOT_BUTTON_GPIO) != 0;
+#endif
     }
 
     void Run() {
         // 1) naam dithered fade-in
         for (int lvl = 2; lvl <= 16; lvl += 2) {
+            if (Skipped()) return Finish();
             Compose(lvl, 0, 0, 0);
             Present(name_p0_, name_p1_);
             vTaskDelay(pdMS_TO_TICKS(15));
@@ -259,6 +498,7 @@ public:
         // 2) neeche ki line beech se dono taraf phailti hai (ease-out)
         constexpr int kSweepSteps = 10;
         for (int s = 1; s <= kSweepSteps; s++) {
+            if (Skipped()) return Finish();
             float t = (float)s / kSweepSteps;
             float e = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
             int half = (int)(e * 52.0f);
@@ -268,30 +508,58 @@ public:
         }
         // 3) tagline fade-in
         for (int lvl = 4; lvl <= 16; lvl += 4) {
+            if (Skipped()) return Finish();
             Compose(16, lvl, 52, 0);
             Present(tag_p0_, tag_p1_);
             vTaskDelay(pdMS_TO_TICKS(25));
         }
-        // 4) thoda ruko
-        vTaskDelay(pdMS_TO_TICKS(450));
-        // 5) sab kuch fade-out
+        // 4) voice equalizer: neeche bars naachte hain (sirf aakhri page update hota hai)
+        const bool eq_ok = tag_p1_ < kPages - 1;
+        if (eq_ok) {
+            for (int f = 0; f < 14; f++) {
+                if (Skipped()) return Finish();
+                Compose(16, 16, 52, 0);
+                DrawEq((float)f * 0.06f);
+                Present(kPages - 1, kPages - 1);
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            Compose(16, 16, 52, 0);                 // bars hatao
+            Present(kPages - 1, kPages - 1);
+        }
+        // 5) thoda ruko
+        vTaskDelay(pdMS_TO_TICKS(200));
+        // 6) sab kuch fade-out
         for (int lvl = 14; lvl >= 0; lvl -= 2) {
+            if (Skipped()) return Finish();
             Compose(lvl, lvl, lvl > 0 ? 52 : 0, lvl);
             Present(name_p0_, tag_p1_);
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        // 6) screen saaf
-        std::memset(fb_, 0, sizeof(fb_));
-        Present(0, kPages - 1);
+        // 7) screen saaf
+        Finish();
     }
 
 private:
     esp_lcd_panel_handle_t panel_;
+    bool skip_enabled_ = false;
     uint8_t fb_[W * kPages] = {};
     uint8_t name_layer_[W * kPages];
     uint8_t tag_layer_[W * kPages];
     int line_y_ = 40;
     int name_p0_ = 0, name_p1_ = 0, line_p0_ = 0, line_p1_ = 0, tag_p0_ = 0, tag_p1_ = 0;
+
+    bool Skipped() const {
+#if SPLASH_SKIP_ON_BUTTON
+        return skip_enabled_ && gpio_get_level(BOOT_BUTTON_GPIO) == 0;
+#else
+        return false;
+#endif
+    }
+
+    void Finish() {
+        std::memset(fb_, 0, sizeof(fb_));
+        Present(0, kPages - 1);
+    }
 
     static void SetPx(uint8_t* layer, int x, int y) {
         if (x < 0 || x >= W || y < 0 || y >= H) return;
@@ -373,12 +641,41 @@ private:
         }
     }
 
+    // Voice equalizer bars: aakhri page (y 56..63) mein, t = seconds
+    void DrawEq(float t) {
+        constexpr int kBars = 11, kBarW = 6, kGap = 4;
+        int total = kBars * kBarW + (kBars - 1) * kGap;
+        int x0 = (W - total) / 2;
+        for (int b = 0; b < kBars; b++) {
+            float ph = t * (5.0f + b * 0.9f) + b * 1.7f;
+            float a = 0.5f + 0.5f * std::sin(ph);
+            int h = 1 + (int)(a * 7.0f + 0.5f);          // 1..8 pixel
+            int bx = x0 + b * (kBarW + kGap);
+            for (int x = 0; x < kBarW; x++)
+                for (int k = 0; k < h; k++)
+                    SetPx(fb_, bx + x, H - 1 - k);
+        }
+    }
+
     // page p0..p1 OLED par bhejo
     void Present(int p0, int p1) {
         if (p0 < 0) p0 = 0;
         if (p1 >= kPages) p1 = kPages - 1;
         if (p1 < p0) return;
+#if SPLASH_ROW_MAJOR
+        // row format: har row ke W/8 byte, MSB = sabse baayan pixel
+        const int rows = (p1 - p0 + 1) * 8;
+        const int y0 = p0 * 8;
+        const int bpr = W / 8;
+        uint8_t tmp[(W / 8) * H];
+        std::memset(tmp, 0, (size_t)bpr * rows);
+        for (int r = 0; r < rows; r++)
+            for (int x = 0; x < W; x++)
+                if (GetPx(fb_, x, y0 + r)) tmp[r * bpr + (x >> 3)] |= (uint8_t)(0x80u >> (x & 7));
+        esp_lcd_panel_draw_bitmap(panel_, 0, y0, W, y0 + rows, tmp);
+#else
         esp_lcd_panel_draw_bitmap(panel_, 0, p0 * 8, W, (p1 + 1) * 8, fb_ + p0 * W);
+#endif
     }
 };
 
