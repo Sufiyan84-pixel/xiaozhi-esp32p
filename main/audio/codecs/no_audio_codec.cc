@@ -17,7 +17,7 @@
 //  MIC     : warm-up skip -> glitch filter -> DC remove -> 100 Hz high-pass
 //            -> smooth AGC (per-sample gain glide) -> soft noise gate
 //            -> soft limiter
-//  SPEAKER : 150 Hz high-pass (chhote speaker ka bass-rattle band)
+//  SPEAKER : 120 Hz high-pass (chhote speaker ka bass-rattle band)
 //            -> smooth volume -> soft limiter -> fade-in -> cute boot chime
 // ============================================================================
 
@@ -183,16 +183,15 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
 int NoAudioCodec::Write(const int16_t* data, int samples) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
 
-    // ---- State (Write sirf ek audio task se call hota hai) ----
-    static float hp_x1 = 0.0f, hp_y1 = 0.0f;   // 150 Hz high-pass memory
-    static float vol_gain = -1.0f;             // smooth volume (negative = abhi init nahi)
+    static float hp_x1 = 0.0f, hp_y1 = 0.0f;
+    static float vol_gain = -1.0f;
     static int write_count = 0;
     static int32_t peak_since = 0;
 
     const float fs = output_sample_rate_ > 0 ? (float)output_sample_rate_ : 24000.0f;
-    const float hp_a = HighPassCoef(150.0f, fs);
-    const float vol_step = 1.0f - std::exp(-1.0f / (fs * 0.02f));   // ~20 ms volume glide
-    const int fade_total = (int)(fs * 0.010f);                      // 10 ms fade-in
+    const float hp_a = HighPassCoef(120.0f, fs);
+    const float vol_step = 1.0f - std::exp(-1.0f / (fs * 0.02f));
+    const int fade_total = (int)(fs * 0.010f);
 
     int vol = output_volume_;
     if (vol < 0) vol = 0;
@@ -209,19 +208,15 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
 
         float x = (float)data[i] * (1.0f / 32768.0f);
 
-        // 150 Hz high-pass: DC aur bahut neeche ka bass hatao (chhota speaker wahan phatta hai)
         float y = hp_a * (hp_y1 + x - hp_x1);
         hp_x1 = x;
         hp_y1 = y;
 
-        // smooth volume (volume badalne par click nahi)
         vol_gain += (vol_target - vol_gain) * vol_step;
         float o = y * vol_gain;
 
-        // naram limiter + max awaaz ka ceiling
         o = SoftLimit(o, 0.7f) * SPEAKER_OUTPUT_SCALE;
 
-        // fade-in (speaker chalu hote hi pop na aaye)
         if (fade_pos < fade_total) {
             o *= (float)fade_pos / (float)fade_total;
             fade_pos++;
@@ -262,7 +257,6 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
 
     samples = bytes_read / sizeof(int32_t);
 
-    // ---- Warm-up: mic ke shuru ka kharab data phenk do ----
     {
         int warm = g_mic_warmup_samples.load();
         if (warm > 0) {
@@ -272,26 +266,26 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         }
     }
 
-    // ---- State (Read sirf ek audio task se call hota hai) ----
-    static int32_t dc_est = 0;          // DC tracker
-    static int32_t prev_v = 0;          // pichla sahi sample
+    static int32_t dc_est = 0;
+    static int32_t prev_v = 0;
     static int glitch_run = 0;
-    static float hp_x1 = 0.0f, hp_y1 = 0.0f;   // 100 Hz high-pass memory
-    static float env = 0.0f;            // awaaz ka envelope (16-bit units)
-    static float gain = 8.0f;           // AGC gain
-    static float gate = 1.0f;           // noise gate gain
+    static float hp_x1 = 0.0f, hp_y1 = 0.0f;
+    static float env = 0.0f;
+    static float gain = 8.0f;
+    static float gate = 1.0f;
     static int read_count = 0;
     static int glitch_total = 0;
+    static float noise_est = 25.0f;
+    static float win_min = 1.0e9f;
+    static float win_acc = 0.0f;
 
-    constexpr int32_t kGlitchJump = 3000000;   // ek sample mein itna bada jump = glitch
-    constexpr float kTargetPeak = 14000.0f;    // output ka target peak (16-bit)
+    constexpr int32_t kGlitchJump = 3000000;
+    constexpr float kTargetPeak = 8000.0f;    // ← 14000 se 8000
     constexpr float kMinGain = 0.5f;
-    constexpr float kMaxGain = 48.0f;          // zyada sensitivity chahiye to badhao (noise bhi badhega)
-    constexpr float kNoiseFloor = 60.0f;       // isse dheemi awaaz = room noise, gain mat badhao
-    constexpr float kGateThresh = 45.0f;       // isse neeche gate band hona shuru
-    constexpr float kGateFloor = 0.5f;         // gate band hone par bhi itna (-6 dB) rehta hai
+    constexpr float kMaxGain = 24.0f;         // ← 64 se 24
+    constexpr float kGateFloor = 0.5f;
 
-    if (g_mic_reset.exchange(false)) {          // naya listening session: sab saaf
+    if (g_mic_reset.exchange(false)) {
         dc_est = 0;
         prev_v = 0;
         glitch_run = 0;
@@ -314,9 +308,8 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         int32_t ar = (r == INT32_MIN) ? INT32_MAX : (r < 0 ? -r : r);
         if (ar > raw_max) raw_max = ar;
 
-        int32_t v = r >> 8;                     // 32-bit slot -> 24-bit signed
+        int32_t v = r >> 8;
 
-        // glitch filter
         int32_t jump = v - prev_v;
         if (jump < 0) jump = -jump;
         if (jump > kGlitchJump && glitch_run < 8) {
@@ -328,11 +321,9 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         }
         prev_v = v;
 
-        // DC hatao
         dc_est += (v - dc_est) / 256;
         float yf = (float)(v - dc_est);
 
-        // 100 Hz high-pass: rumble / table-thump / handling noise hatao
         float yh = hp_a * (hp_y1 + yf - hp_x1);
         hp_x1 = yf;
         hp_y1 = yh;
@@ -342,21 +333,35 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         if (ay > block_peak) block_peak = ay;
     }
 
-    // ---- Smooth AGC + gate (block ke hisaab se, per-sample glide ke saath) ----
     const float blk = samples > 0 ? (float)samples / 160.0f : 1.0f;
     auto coef = [blk](float c) { return 1.0f - std::pow(1.0f - c, blk); };
 
     const float gain_prev = gain;
     const float gate_prev = gate;
-    const float peak16 = block_peak / 256.0f;   // gain ke bina peak (16-bit units)
+    const float peak16 = block_peak / 256.0f;
 
     if (samples > 0) {
-        // envelope: upar turant, neeche dheere (pumping nahi hogi)
+        if (peak16 < win_min) win_min = peak16;
+        if (peak16 < noise_est) noise_est += (peak16 - noise_est) * coef(0.2f);
+        win_acc += blk;
+        if (win_acc >= 300.0f) {
+            if (win_min > noise_est) noise_est += (win_min - noise_est) * 0.5f;
+            win_min = 1.0e9f;
+            win_acc = 0.0f;
+        }
+    }
+    float noise_floor = noise_est * 3.0f;
+    if (noise_floor < 12.0f) noise_floor = 12.0f;
+    if (noise_floor > 150.0f) noise_floor = 150.0f;
+    float gate_thresh = noise_est * 2.0f;
+    if (gate_thresh < 8.0f) gate_thresh = 8.0f;
+    if (gate_thresh > 80.0f) gate_thresh = 80.0f;
+
+    if (samples > 0) {
         if (peak16 > env) env = peak16;
         else env += (peak16 - env) * coef(0.08f);
 
-        // AGC: gain neeche tez, upar dheere
-        if (env > kNoiseFloor) {
+        if (env > noise_floor) {
             float g_target = kTargetPeak / env;
             if (g_target < kMinGain) g_target = kMinGain;
             if (g_target > kMaxGain) g_target = kMaxGain;
@@ -364,15 +369,14 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         }
 
 #if MIC_NOISE_GATE
-        float gate_target = (env < kGateThresh) ? kGateFloor : 1.0f;
+        float gate_target = (env < gate_thresh) ? kGateFloor : 1.0f;
         gate += (gate_target - gate) * coef(gate_target < gate ? 0.05f : 0.5f);
 #endif
     }
 
-    // ---- Output: per-sample gain glide + soft limiter ----
     const float total_prev = gain_prev * gate_prev;
     const float total_new = gain * gate;
-    const float norm = 1.0f / (256.0f * 32768.0f);   // 24-bit units -> +-1.0
+    const float norm = 1.0f / (256.0f * 32768.0f);
     for (int i = 0; i < samples; i++) {
         float t = samples > 1 ? (float)i / (float)(samples - 1) : 1.0f;
         float g = total_prev + (total_new - total_prev) * t;
@@ -382,10 +386,9 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         dest[i] = (int16_t)o;
     }
 
-    // ---- Log (har ~1 second). Note: %f nano-printf mein nahi chalta, isliye x10 int ----
     if (read_count++ % 100 == 0) {
-        ESP_LOGI(TAG, "🎤 MIC | raw=%ld | clean=%d | gain x10=%d | gate x10=%d | glitches=%d",
-                 (long)raw_max, (int)peak16, (int)(gain * 10.0f), (int)(gate * 10.0f), glitch_total);
+        ESP_LOGI(TAG, "🎤 MIC | raw=%ld | clean=%d | noise=%d | gain x10=%d | gate x10=%d | glitches=%d",
+                 (long)raw_max, (int)peak16, (int)noise_est, (int)(gain * 10.0f), (int)(gate * 10.0f), glitch_total);
         glitch_total = 0;
     }
 
@@ -411,7 +414,6 @@ void NoAudioCodec::EnableInput(bool enable) {
 }
 
 #if SPEAKER_BOOT_CHIME
-// Cute boot chime: C5 - E5 - G5 - C6, bell jaisi naram awaaz (ye speaker test bhi hai)
 static void PlayBootChime(i2s_chan_handle_t tx, int sample_rate) {
     static const float kNotes[] = {523.25f, 659.25f, 783.99f, 1046.50f};
     constexpr int kNoteCount = 4;
@@ -452,7 +454,7 @@ void NoAudioCodec::EnableOutput(bool enable) {
     if (enable == output_enabled_) return;
     if (enable) {
         ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
-        g_spk_fade_pos.store(0);                // agla Write fade-in se shuru hoga
+        g_spk_fade_pos.store(0);
         ESP_LOGI(TAG, "🔊 SPK enabled");
 #if SPEAKER_BOOT_CHIME
         static bool chime_done = false;
