@@ -5,6 +5,7 @@
 #include "board.h"
 #include "cjson_utils.h"
 #include "display.h"
+#include "display/oled_display.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -161,9 +162,7 @@ void Application::Initialize() {
     board.StartNetwork();
     display->UpdateStatusBar(true);
 
-    // ============================================================
-    //  NTP Setup (network start ke BAAD)
-    // ============================================================
+    // NTP Setup (network start ke BAAD)
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_setservername(1, "time.google.com");
@@ -948,7 +947,7 @@ void Application::HandleStateChangedEvent() {
                 if (oled) {
                     oled->ShowPremiumIdleScreen();
                 }
-                display->SetEmotion("neutral");
+                display->ClearChatMessages();
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
