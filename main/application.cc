@@ -5,6 +5,7 @@
 #include "board.h"
 #include "cjson_utils.h"
 #include "display.h"
+#include "display/oled_display.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -63,17 +64,6 @@ bool Application::SetDeviceState(DeviceState state) { return state_machine_.Tran
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
-
-    // ============================================================
-    //  NTP Setup for IST Date/Time
-    // ============================================================
-    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.google.com");
-    esp_sntp_init();
-    setenv("TZ", "IST-5:30", 1);
-    tzset();
-    ESP_LOGI(TAG, "NTP initialized (IST timezone)");
 
     // Setup the display
     auto display = board.GetDisplay();
@@ -171,6 +161,17 @@ void Application::Initialize() {
 
     board.StartNetwork();
     display->UpdateStatusBar(true);
+
+    // ============================================================
+    //  NTP Setup (network start ke BAAD)
+    // ============================================================
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_init();
+    setenv("TZ", "IST-5:30", 1);
+    tzset();
+    ESP_LOGI(TAG, "NTP initialized (IST timezone)");
 }
 
 void Application::Run() {
@@ -269,18 +270,12 @@ void Application::Run() {
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
-            // ============================================================
-            //  Idle State Par Date/Time Dikhao (IST)
-            // ============================================================
+            // Idle par premium screen dikhao
             if (GetDeviceState() == kDeviceStateIdle) {
-                time_t now;
-                struct tm timeinfo;
-                time(&now);
-                localtime_r(&now, &timeinfo);
-
-                char time_str[64];
-                strftime(time_str, sizeof(time_str), "%H:%M | %d %b %Y", &timeinfo);
-                display->SetStatus(time_str);
+                auto* oled = static_cast<OledDisplay*>(display);
+                if (oled) {
+                    oled->ShowPremiumIdleScreen();
+                }
             }
 
             if (clock_ticks_ % 10 == 0) {
@@ -950,17 +945,11 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             if (last_error_message_.empty()) {
-                // Idle par date/time dikhao (IST)
-                time_t now;
-                struct tm timeinfo;
-                time(&now);
-                localtime_r(&now, &timeinfo);
-
-                char time_str[64];
-                strftime(time_str, sizeof(time_str), "%H:%M | %d %b %Y", &timeinfo);
-                display->SetStatus(time_str);
+                auto* oled = static_cast<OledDisplay*>(display);
+                if (oled) {
+                    oled->ShowPremiumIdleScreen();
+                }
                 display->ClearChatMessages();
-                display->SetEmotion("neutral");
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
