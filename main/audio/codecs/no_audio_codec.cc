@@ -22,14 +22,24 @@
 //  Design: speech-recognition ko "natural" awaaz pasand hai. Isliye mic par
 //  halka aur smooth processing hai (gain dheere badalta hai), gate band hai
 //  (gate shabdon ka shuru kaat deta tha), aur clipping se turant bachav hai.
+//
+//  TUNING (fixed for noisy INMP441 + PAM8403 setups):
+//    - kMaxGain     : 80 -> 20   (+38dB -> +26dB) — gain jump kam
+//    - kMaxIdleGain : 16 -> 10   — idle par kam gain, noise kam
+//    - kTargetRms   : 2200 -> 1200 (~-28.7 dBFS) — clipping safe margin
+//    - kPeakCeiling : 26000 -> 18000 — peak headroom
+//    - kBurstGlitches: 12 -> 4   — WiFi/speaker interference turant pakdo
+//    - speech_floor : 2.2x -> 3.0x noise_est — noisy mic par sahi
 // ============================================================================
 
 #define SPEAKER_BOOT_CHIME 1
 #define SPEAKER_CHIME_LEVEL 0.14f
 #define SPEAKER_OUTPUT_SCALE 0.4f    // awaaz phate to kam karo, dheemi lage to badhao (max 0.6)
 
-// 1 = halka noise gate. Default 0: gate shabd ka pehla hissa dabata hai, ASR ko nuksaan.
-#define MIC_NOISE_GATE 0
+// 1 = noise expander: jab sirf noise ho (shabdon ke beech / chup) to mic ki awaaz ~-8 dB dabti hai.
+// "Noise" kitna hai wo device khud napta hai (noise=... log mein), isliye har mic par kaam karta hai.
+// Kabhi poora mute nahi hota. Shabd ka shuru kharab lage to 0 kar do.
+#define MIC_NOISE_GATE 1
 
 namespace {
 
@@ -271,14 +281,17 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
     }
 
     // ---- Tuning (16-bit units: 32768 = full scale) ----
+    // FIXED: safer AGC + sensitive burst detect + lower target for noisy mics
     constexpr int32_t kGlitchJump = 3000000;    // ek sample mein itna bada jump = glitch (24-bit units)
-    constexpr float kTargetRms = 2200.0f;       // output ka target RMS (~ -23.5 dBFS)
+    constexpr float kTargetRms = 1200.0f;       // CHANGED: 2200 -> 1200 (~-28.7 dBFS, clipping safe)
     constexpr float kMinGain = 0.3f;
-    constexpr float kMaxGain = 80.0f;           // +38 dB
-    constexpr float kIdleGain = 16.0f;          // chup rehne par gain yahan tak laut aata hai (+24 dB)
-        constexpr float kGainDownPer10ms = 0.70f;   // gain ghatna: -3 dB / 10 ms (tez)
+    constexpr float kMaxGain = 20.0f;           // CHANGED: 80 -> 20  (+26 dB max)
+    constexpr float kMaxIdleGain = 10.0f;       // CHANGED: 16 -> 10
+    constexpr int kBurstGlitches = 4;           // CHANGED: 12 -> 4 (WiFi/speaker burst turant pakdo)
+    constexpr float kExpFloor = 0.40f;          // expander ka minimum (-8 dB)
+    constexpr float kGainDownPer10ms = 0.70f;   // gain ghatna: -3 dB / 10 ms (tez)
     constexpr float kIdleDriftPer10ms = 1.0116f;// chup mein idle gain ki taraf: 0.1 dB / 10 ms
-    constexpr float kPeakCeiling = 26000.0f;    // output peak isse upar nahi jaana chahiye
+    constexpr float kPeakCeiling = 18000.0f;    // CHANGED: 26000 -> 18000 (peak headroom)
 
     // ---- State (Read sirf ek audio task se call hota hai) ----
     static int32_t dc_est = 0;
@@ -286,8 +299,9 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
     static int glitch_run = 0;
     static float hp_x1 = 0.0f, hp_y1 = 0.0f;
     static float level = 0.0f;           // awaaz ka smooth RMS (gain se pehle)
-    static float gain = kIdleGain;
+    static float gain = 8.0f;
     static float gate = 1.0f;
+    static int burst_total = 0;
     static float noise_est = 25.0f;      // room noise RMS ka andaza (sessions ke beech yaad rehta hai)
     static float win_min = 1.0e9f;
     static float win_acc = 0.0f;
@@ -301,7 +315,9 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         hp_x1 = 0.0f;
         hp_y1 = 0.0f;
         level = 0.0f;
-        gain = kIdleGain;
+        gain = 900.0f / (noise_est > 1.0f ? noise_est : 1.0f);
+        if (gain > kMaxIdleGain) gain = kMaxIdleGain;
+        if (gain < 3.0f) gain = 3.0f;
         gate = 1.0f;
     }
 
@@ -311,6 +327,7 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
     int32_t raw_max = 0;
     float block_peak = 0.0f;
     double sum_sq = 0.0;
+    int blk_glitches = 0;
     std::vector<float> clean(samples);
 
     for (int i = 0; i < samples; i++) {
@@ -327,6 +344,7 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
             v = prev_v;
             glitch_run++;
             glitch_total++;
+            blk_glitches++;
         } else {
             glitch_run = 0;
         }
@@ -353,7 +371,12 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
     const float peak16 = block_peak / 256.0f;                          // gain se pehle peak
     const float rms16 = samples > 0 ? (float)std::sqrt(sum_sq / samples) / 256.0f : 0.0f;
 
-    if (samples > 0) {
+    // Interference ka dhamaka (Wi-Fi / power noise): ye block server ko mat bhejo, aur
+    // isse noise / level / gain ke andaze bigadne mat do.
+    const bool burst = blk_glitches > kBurstGlitches;
+    if (burst) burst_total++;
+
+    if (samples > 0 && !burst) {
         // ---- room noise ka andaza (har ~3 sec ka sabse dheema block) ----
         if (rms16 < win_min) win_min = rms16;
         if (rms16 < noise_est) noise_est += (rms16 - noise_est) * coef(0.2f);
@@ -368,9 +391,16 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         if (rms16 > level) level += (rms16 - level) * coef(0.5f);
         else level += (rms16 - level) * coef(0.03f);
 
-        float speech_floor = noise_est * 2.5f;
-        if (speech_floor < 6.0f) speech_floor = 6.0f;
-        if (speech_floor > 100.0f) speech_floor = 100.0f;
+        // Awaaz tab maani jaati hai jab wo noise se kaafi upar ho (noisy mic par bhi sahi)
+        // FIXED: noise ke saath 3.0x + min 10 (noisy INMP441 ke liye)
+        float speech_floor = noise_est * 3.0f;
+        if (speech_floor < 10.0f) speech_floor = 10.0f;
+        if (speech_floor > 3000.0f) speech_floor = 3000.0f;
+
+        // Chup mein gain itna ki noise bahut zor se na sunai de (noisy mic par kam, clean par 10x)
+        float idle_gain = 900.0f / (noise_est > 1.0f ? noise_est : 1.0f);
+        if (idle_gain > kMaxIdleGain) idle_gain = kMaxIdleGain;
+        if (idle_gain < 3.0f) idle_gain = 3.0f;
 
         if (level > speech_floor) {
             // ---- AGC: gain ko target RMS ki taraf, rate-limited (smooth) ----
@@ -392,12 +422,12 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
             }
         } else {
             // ---- chup: gain dheere dheere idle value ki taraf ----
-            if (gain > kIdleGain) {
+            if (gain > idle_gain) {
                 float d = gain / std::pow(kIdleDriftPer10ms, blk);
-                gain = d > kIdleGain ? d : kIdleGain;
-            } else if (gain < kIdleGain) {
+                gain = d > idle_gain ? d : idle_gain;
+            } else if (gain < idle_gain) {
                 float u = gain * std::pow(kIdleDriftPer10ms, blk);
-                gain = u < kIdleGain ? u : kIdleGain;
+                gain = u < idle_gain ? u : idle_gain;
             }
         }
 
@@ -408,8 +438,13 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
         }
 
 #if MIC_NOISE_GATE
-        float gate_target = (level < noise_est * 1.8f) ? 0.7f : 1.0f;
-        gate += (gate_target - gate) * coef(gate_target < gate ? 0.05f : 0.6f);
+        // ---- noise expander: signal noise ke kareeb ho to halka dabao, upar ho to poora kholo ----
+        float sig = rms16 > level ? rms16 : level;          // khulna turant, band hona ~300 ms
+        float lo = noise_est * 1.6f, hi = noise_est * 3.0f;
+        float g_exp = sig <= lo ? kExpFloor
+                    : sig >= hi ? 1.0f
+                    : kExpFloor + (1.0f - kExpFloor) * (sig - lo) / (hi - lo);
+        gate += (g_exp - gate) * coef(g_exp > gate ? 0.7f : 0.08f);
 #endif
     }
 
@@ -418,6 +453,7 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
     const float total_new = gain * gate;
     const float norm = 1.0f / (256.0f * 32768.0f);   // 24-bit units -> +-1.0
     for (int i = 0; i < samples; i++) {
+        if (burst) { dest[i] = 0; continue; }
         float t = samples > 1 ? (float)i / (float)(samples - 1) : 1.0f;
         float g = total_prev + (total_new - total_prev) * t;
         float o = SoftLimit(clean[i] * g * norm, 0.85f) * 32767.0f;
@@ -428,9 +464,11 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
 
     // ---- Log (har ~1 second). %f nano-printf mein nahi chalta, isliye int ----
     if (read_count++ % 100 == 0) {
-        ESP_LOGI(TAG, "🎤 MIC | raw=%ld | rms=%d | peak=%d | noise=%d | gain x10=%d | glitches=%d",
-                 (long)raw_max, (int)rms16, (int)peak16, (int)noise_est, (int)(gain * 10.0f), glitch_total);
+        ESP_LOGI(TAG, "🎤 MIC | raw=%ld | rms=%d | peak=%d | noise=%d | gain x10=%d | gate x10=%d | glitches=%d | bursts=%d",
+                 (long)raw_max, (int)rms16, (int)peak16, (int)noise_est, (int)(gain * 10.0f), (int)(gate * 10.0f),
+                 glitch_total, burst_total);
         glitch_total = 0;
+        burst_total = 0;
     }
 
     return samples;
@@ -515,7 +553,7 @@ void NoAudioCodec::EnableOutput(bool enable) {
 // ============================================================================
 //  PDM Variant
 // ============================================================================
-NoAudioCodecSimplexPdm::NoAudioCodecSimplexPdm(int input_sample_rate, int output_sample_rate, gpio_num_t spk_bclk, gpio_num_t spk_ws, gpio_num_t spk_dout, gpio_num_t mic_sck, gpio_num_t mic_din) 
+NoAudioCodecSimplexPdm::NoAudioCodecSimplexPdm(int input_sample_rate, int output_sample_rate, gpio_num_t spk_bclk, gpio_num_t spk_ws, gpio_num_t spk_dout, gpio_num_t mic_sck, gpio_num_t mic_din)
     : NoAudioCodecSimplexPdm(input_sample_rate, output_sample_rate, spk_bclk, spk_ws, spk_dout, I2S_STD_SLOT_LEFT, mic_sck, mic_din) {}
 
 NoAudioCodecSimplexPdm::NoAudioCodecSimplexPdm(int input_sample_rate, int output_sample_rate, gpio_num_t spk_bclk, gpio_num_t spk_ws, gpio_num_t spk_dout, i2s_std_slot_mask_t spk_slot_mask, gpio_num_t mic_sck, gpio_num_t mic_din) {
