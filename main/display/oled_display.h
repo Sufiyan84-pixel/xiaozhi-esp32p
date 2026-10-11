@@ -47,7 +47,6 @@ private:
     // Robot face canvas
     lv_obj_t* face_canvas_ = nullptr;
     lv_color_t* canvas_buffer_ = nullptr;
-    RobotState current_robot_state_ = RobotState::Idle;
 
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
@@ -56,6 +55,9 @@ private:
     void SetupUI_128x32();
 
 public:
+    // ⬇️⬇️ YEH 1 LINE PUBLIC MEIN AA GAYI ⬇️⬇️
+    RobotState current_robot_state_ = RobotState::Idle;
+
     OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
                 int height, bool mirror_x, bool mirror_y);
     ~OledDisplay();
@@ -78,7 +80,7 @@ public:
     void StartThinkingAnimation();
     void StopAllAnimations();
 
-    // === Robot drawing functions (PUBLIC - timer callbacks ke liye zaroori) ===
+    // === Robot drawing functions ===
     void DrawRobotFace(RobotState state, int anim_frame);
     void DrawEye(int x, int y, int w, int h, bool blink);
     void DrawMouth(int x, int y, int w, int h, int open);
