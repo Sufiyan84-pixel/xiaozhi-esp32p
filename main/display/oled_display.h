@@ -12,7 +12,7 @@
 // ============================================================================
 enum class RobotState {
     Idle,        // Normal eyes, smile
-    Listening,   // Wide eyes, small mouth
+    Listening,   // Wide eyes, kaano jaisa
     Speaking,    // Mouth open/close
     Thinking,    // Eyes up
     Happy,       // Squinted eyes, big smile
