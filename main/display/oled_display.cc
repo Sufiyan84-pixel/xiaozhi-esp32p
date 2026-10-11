@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <string>
 #include <ctime>
+#include <atomic>
 
 #include <esp_err.h>
 #include <esp_log.h>
@@ -24,16 +25,15 @@ LV_FONT_DECLARE(font_noto_emoji_30_1);
 
 // ============================================================================
 //  Robot face canvas dimensions (SH1106 1.3" = 128x64)
-//  Face size 64x64 = left side, right side chat text
 // ============================================================================
 #define FACE_W 64
 #define FACE_H 64
 
-// Animation frame counters
-static volatile int g_blink_frame = 0;
-static volatile int g_speak_frame = 0;
-static volatile bool g_blink_active = false;
-static volatile bool g_speak_active = false;
+// Animation counters — atomic (thread-safe, volatile warning nahi)
+static std::atomic<int>  g_blink_frame{0};
+static std::atomic<int>  g_speak_frame{0};
+static std::atomic<bool> g_blink_active{false};
+static std::atomic<bool> g_speak_active{false};
 
 // ============================================================================
 //  CONSTRUCTOR
@@ -140,13 +140,12 @@ bool OledDisplay::Lock(int timeout_ms) { return lvgl_port_lock(timeout_ms); }
 void OledDisplay::Unlock() { lvgl_port_unlock(); }
 
 // ============================================================================
-//  SETUP UI  —  FIX: label existence check (setup_ui_called_ bug fixed)
+//  SETUP UI  —  FIX: label existence check
 // ============================================================================
 void OledDisplay::SetupUI() {
     ESP_LOGI(TAG, "SetupUI called: height=%d, status_label_=%p",
              height_, (void*)status_label_);
 
-    // AGAR labels already bane hain toh skip (double-create se bacho)
     if (status_label_ != nullptr) {
         ESP_LOGW(TAG, "SetupUI already done, skipping");
         return;
@@ -296,7 +295,6 @@ void OledDisplay::SetupUI_128x64() {
     canvas_buffer_ = (lv_color_t*)heap_caps_malloc(FACE_W * FACE_H * sizeof(lv_color_t),
                                                    MALLOC_CAP_SPIRAM);
     if (canvas_buffer_ == nullptr) {
-        // PSRAM nahi toh internal RAM try karo
         canvas_buffer_ = (lv_color_t*)heap_caps_malloc(FACE_W * FACE_H * sizeof(lv_color_t),
                                                        MALLOC_CAP_8BIT);
     }
@@ -356,7 +354,7 @@ void OledDisplay::SetupUI_128x64() {
 // ============================================================================
 void OledDisplay::SetupUI_128x32() {
     DisplayLockGuard lock(this);
-    ESP_LOGW(TAG, "SetupUI_128x32 called — tumhara SH1106 1.3\" hai toh yeh NAHI hona chahiye");
+    ESP_LOGW(TAG, "SetupUI_128x32 called — agar tumhara SH1106 1.3\" hai toh yeh NAHI hona chahiye");
 
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     auto text_font = lvgl_theme->text_font()->font();
@@ -366,7 +364,6 @@ void OledDisplay::SetupUI_128x32() {
     lv_obj_set_style_text_font(screen, text_font, 0);
     lv_obj_set_style_text_color(screen, lv_color_black(), 0);
 
-    // Simple status label — center mein
     status_label_ = lv_label_create(screen);
     lv_obj_set_width(status_label_, LV_HOR_RES);
     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
@@ -374,10 +371,8 @@ void OledDisplay::SetupUI_128x32() {
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
 
-    // Notification = same label (alias)
     notification_label_ = status_label_;
 
-    // Tiny icons
     network_label_ = lv_label_create(screen);
     lv_label_set_text(network_label_, "");
     lv_obj_set_style_text_font(network_label_, icon_font, 0);
@@ -393,7 +388,6 @@ void OledDisplay::SetupUI_128x32() {
     lv_obj_set_style_text_font(battery_label_, icon_font, 0);
     lv_obj_align(battery_label_, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
 
-    // Chat message (single line)
     chat_message_label_ = lv_label_create(screen);
     lv_label_set_text(chat_message_label_, "");
     lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -404,7 +398,7 @@ void OledDisplay::SetupUI_128x32() {
 }
 
 // ============================================================================
-//  DRAW HELPERS  —  LVGL 9 canvas layer based
+//  DRAW HELPERS
 // ============================================================================
 void OledDisplay::DrawEye(int x, int y, int w, int h, bool blink) {
     if (face_canvas_ == nullptr || canvas_buffer_ == nullptr) return;
@@ -462,10 +456,8 @@ void OledDisplay::DrawMouth(int x, int y, int w, int h, int open) {
 void OledDisplay::DrawRobotFace(RobotState state, int anim_frame) {
     if (face_canvas_ == nullptr || canvas_buffer_ == nullptr) return;
 
-    // Clear canvas to black
     lv_canvas_fill_bg(face_canvas_, lv_color_black(), LV_OPA_COVER);
 
-    // Base layout (64x64 canvas)
     const int eye_w = 16, eye_h = 16;
     const int eye_y = 16;
     const int left_x = 8;
@@ -475,66 +467,50 @@ void OledDisplay::DrawRobotFace(RobotState state, int anim_frame) {
 
     switch (state) {
         case RobotState::Idle: {
-            // Blink every ~60 frames (frames increment via timer)
             bool blink = (anim_frame % 60 < 4);
             DrawEye(left_x, eye_y, eye_w, eye_h, blink);
             DrawEye(right_x, eye_y, eye_w, eye_h, blink);
             DrawMouth(mouth_x, mouth_y, mouth_w, mouth_h, 0);
             break;
         }
-
         case RobotState::Listening: {
-            // Wide eyes
             DrawEye(left_x - 2, eye_y - 2, eye_w + 4, eye_h + 4, false);
             DrawEye(right_x - 2, eye_y - 2, eye_w + 4, eye_h + 4, false);
             DrawMouth(mouth_x + 4, mouth_y, mouth_w - 8, mouth_h, 0);
             break;
         }
-
         case RobotState::Speaking: {
-            // Mouth open/close
             int open = (anim_frame % 20 < 10) ? 8 : 0;
             DrawEye(left_x, eye_y, eye_w, eye_h, false);
             DrawEye(right_x, eye_y, eye_w, eye_h, false);
             DrawMouth(mouth_x, mouth_y - open / 2, mouth_w, mouth_h, open);
             break;
         }
-
         case RobotState::Thinking: {
-            // Eyes up + small
             DrawEye(left_x, eye_y - 3, eye_w - 2, eye_h - 2, false);
             DrawEye(right_x + 2, eye_y - 3, eye_w - 2, eye_h - 2, false);
             DrawMouth(mouth_x + 8, mouth_y, mouth_w - 16, mouth_h, 0);
             break;
         }
-
         case RobotState::Happy: {
-            // Squint eyes (curved) + big smile
             DrawEye(left_x, eye_y + 4, eye_w, 6, false);
             DrawEye(right_x, eye_y + 4, eye_w, 6, false);
             DrawMouth(mouth_x - 4, mouth_y - 2, mouth_w + 8, mouth_h + 4, 4);
             break;
         }
-
         case RobotState::Sad: {
-            // Droopy eyes + frown
             DrawEye(left_x, eye_y + 2, eye_w, eye_h - 4, false);
             DrawEye(right_x, eye_y + 2, eye_w, eye_h - 4, false);
-            // Frown: chhota mouth upar
             DrawMouth(mouth_x + 6, mouth_y + 4, mouth_w - 12, mouth_h - 2, 0);
             break;
         }
-
         case RobotState::Sleeping: {
-            // Closed eyes (lines)
             DrawEye(left_x, eye_y + 6, eye_w, 2, false);
             DrawEye(right_x, eye_y + 6, eye_w, 2, false);
             DrawMouth(mouth_x + 8, mouth_y, mouth_w - 16, mouth_h, 0);
             break;
         }
-
         case RobotState::Surprised: {
-            // Big eyes + open mouth
             DrawEye(left_x - 2, eye_y - 2, eye_w + 4, eye_h + 4, false);
             DrawEye(right_x - 2, eye_y - 2, eye_w + 4, eye_h + 4, false);
             DrawMouth(mouth_x + 4, mouth_y - 2, mouth_w - 8, mouth_h + 4, 8);
@@ -553,32 +529,31 @@ void OledDisplay::SetRobotState(RobotState state) {
 }
 
 // ============================================================================
-//  ANIMATIONS  —  LVGL timer based (safe, no crash)
+//  ANIMATIONS  —  LVGL timer based
 // ============================================================================
 static void blink_timer_cb(lv_timer_t* timer) {
     auto* self = static_cast<OledDisplay*>(lv_timer_get_user_data(timer));
     if (self == nullptr) return;
     g_blink_frame++;
-    self->DrawRobotFace(self->current_robot_state_, g_blink_frame);
+    self->DrawRobotFace(self->current_robot_state_, g_blink_frame.load());
 }
 
 static void speak_timer_cb(lv_timer_t* timer) {
     auto* self = static_cast<OledDisplay*>(lv_timer_get_user_data(timer));
     if (self == nullptr) return;
     g_speak_frame++;
-    self->DrawRobotFace(RobotState::Speaking, g_speak_frame);
+    self->DrawRobotFace(RobotState::Speaking, g_speak_frame.load());
 }
 
 void OledDisplay::StartBlinkAnimation() {
-    if (face_canvas_ == nullptr || g_blink_active) return;
-    g_blink_active = true;
-    // 100 ms tick = 10 fps
+    if (face_canvas_ == nullptr || g_blink_active.load()) return;
+    g_blink_active.store(true);
     lv_timer_create(blink_timer_cb, 100, this);
 }
 
 void OledDisplay::StartSpeakingAnimation() {
-    if (face_canvas_ == nullptr || g_speak_active) return;
-    g_speak_active = true;
+    if (face_canvas_ == nullptr || g_speak_active.load()) return;
+    g_speak_active.store(true);
     lv_timer_create(speak_timer_cb, 80, this);
 }
 
@@ -591,10 +566,8 @@ void OledDisplay::StartThinkingAnimation() {
 }
 
 void OledDisplay::StopAllAnimations() {
-    g_blink_active = false;
-    g_speak_active = false;
-    // Timers LVGL ke andar delete nahi kar rahe, sirf flag off
-    // Agli animation pe naye timer banenge
+    g_blink_active.store(false);
+    g_speak_active.store(false);
 }
 
 // ============================================================================
