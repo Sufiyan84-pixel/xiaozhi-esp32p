@@ -589,7 +589,7 @@ void OledDisplay::SetEmotion(const char* emotion) {
     else if (strcmp(emotion, "speaking")  == 0) SetRobotState(RobotState::Speaking);
     else if (strcmp(emotion, "neutral")   == 0) SetRobotState(RobotState::Idle);
     else                                        SetRobotState(RobotState::Idle);
-}
+} 
 
 // ============================================================================
 //  PREMIUM IDLE SCREEN
