@@ -12,7 +12,7 @@
 // ============================================================================
 enum class RobotState {
     Idle,        // Normal eyes, smile
-    Listening,   // Wide eyes, kaano jaisa
+    Listening,   // Wide eyes, small mouth
     Speaking,    // Mouth open/close
     Thinking,    // Eyes up
     Happy,       // Squinted eyes, big smile
@@ -55,11 +55,6 @@ private:
     void SetupUI_128x64();
     void SetupUI_128x32();
 
-    // Robot drawing functions
-    void DrawRobotFace(RobotState state, int anim_frame);
-    void DrawEye(int x, int y, int w, int h, bool blink);
-    void DrawMouth(int x, int y, int w, int h, int open);
-
 public:
     OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
                 int height, bool mirror_x, bool mirror_y);
@@ -82,6 +77,11 @@ public:
     void StartListeningAnimation();
     void StartThinkingAnimation();
     void StopAllAnimations();
+
+    // === Robot drawing functions (PUBLIC - timer callbacks ke liye zaroori) ===
+    void DrawRobotFace(RobotState state, int anim_frame);
+    void DrawEye(int x, int y, int w, int h, bool blink);
+    void DrawMouth(int x, int y, int w, int h, int open);
 };
 
 #endif  // OLED_DISPLAY_H
